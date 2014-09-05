@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"flag"
 	"io"
 	"io/ioutil"
 	"log"
@@ -26,6 +27,7 @@ type DnsHeader struct {
 var (
 	httpClient = &http.Client{}
 	exp        = regexp.MustCompile(`<span class=t2>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})</span>`)
+	listen     = flag.String("listen", "127.0.0.1:53", "dns监听地址，格式为 ip:port")
 )
 
 const (
@@ -139,13 +141,13 @@ func recvData(sock *net.UDPConn) ([]byte, *net.UDPAddr, error) {
 }
 
 func proxyQuery(data []byte, serv *net.UDPConn, client *net.UDPAddr) {
-	sock, err := bindUDP("10.15.44.83:0")
+	sock, err := bindUDP("0.0.0.0:0")
 	if err != nil {
 		log.Println("bindUDP failed:", err)
 		return
 	}
 	defer sock.Close()
-	realaddr, err := net.ResolveUDPAddr("udp", "127.0.1.1:53")
+	realaddr, err := net.ResolveUDPAddr("udp", *listen)
 	if err != nil {
 		panic(err)
 	}
@@ -194,6 +196,8 @@ func main() {
 	defer sock.Close()
 	for {
 		data, peer, err := recvData(sock)
+		go proxyQuery(data, sock, peer)
+		continue
 		log.Println("recv query")
 		id, domain, err := parseQuery(data)
 		if err != nil {
@@ -202,7 +206,6 @@ func main() {
 		}
 		if domain == "" {
 			log.Println("proxyQuery")
-			go proxyQuery(data, sock, peer)
 		} else {
 			log.Println("queryWeb:", domain)
 			ip, err := queryWeb(domain)
