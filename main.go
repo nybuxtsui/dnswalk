@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
+	"io"
+	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -18,6 +22,11 @@ type DnsHeader struct {
 	NsCount uint16
 	ArCount uint16
 }
+
+var (
+	httpClient = &http.Client{}
+	exp        = regexp.MustCompile(`<span class=t2>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})</span>`)
+)
 
 const (
 	PACKAGE_MAX = 64 * 1024
@@ -41,7 +50,7 @@ func buildAnswer(id uint16, domain string, ip string) ([]byte, error) {
 	}
 	buff.WriteByte(0)
 	binary.Write(buff, binary.BigEndian, uint32(0x00010001))
-	buff.Write([]byte{0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 1, 2, 3, 4})
+	buff.Write([]byte{0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04})
 	for _, ippart := range strings.Split(ip, ".") {
 		b, err := strconv.ParseUint(ippart, 10, 8)
 		if err != nil {
@@ -58,18 +67,21 @@ func parseQuery(data []byte) (uint16, string, error) {
 	var dnsHeader DnsHeader
 	err := binary.Read(buff, binary.BigEndian, &dnsHeader)
 	if err != nil {
-		log.Println("Data Error: %s\n", err.Error())
-		return 0, "", errors.New("data_error")
+		log.Println("Read failed:", err)
+		return 0, "", err
 	}
-	log.Println(dnsHeader, len(data))
+	if dnsHeader.QdCount != 1 {
+		log.Println("multiquery")
+		return 0, "", nil
+	}
 
 	domain := new(bytes.Buffer)
 	for {
 		var length uint8
 		err = binary.Read(buff, binary.BigEndian, &length)
 		if err != nil {
-			log.Println("Data Error: %s\n", err.Error())
-			return 0, "", errors.New("data_error")
+			log.Println("Read failed:", err)
+			return 0, "", err
 		}
 		if length == 0 {
 			break
@@ -78,50 +90,145 @@ func parseQuery(data []byte) (uint16, string, error) {
 			domain.WriteByte('.')
 		}
 		namepart := make([]byte, length)
-		n, err := buff.Read(namepart)
+		_, err = io.ReadFull(buff, namepart)
 		if err != nil {
-			log.Println("Data Error: %s\n", err.Error())
-			return 0, "", errors.New("data_error")
-		}
-		if n != int(length) {
-			log.Println("Data Error: eof\n")
-			return 0, "", errors.New("data_error")
+			log.Println("Read failed:", err)
+			return 0, "", err
 		}
 		domain.Write(namepart)
 	}
-	log.Println(domain.String())
+	var qtype struct {
+		Type  uint16
+		Class uint16
+	}
+	err = binary.Read(buff, binary.BigEndian, &qtype)
+	if err != nil {
+		log.Println("Read failed:", err)
+		return 0, "", err
+	}
+	if qtype.Type != 1 || qtype.Class != 1 {
+		log.Println("unknowtype", qtype)
+		return 0, "", nil
+	}
+
 	return dnsHeader.Id, domain.String(), nil
+}
+
+func bindUDP(udpaddr string) (*net.UDPConn, error) {
+	addr, err := net.ResolveUDPAddr("udp", udpaddr)
+	if err != nil {
+		log.Println("ResolveUDPAddr failed:", err)
+		return nil, err
+	}
+	sock, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Println("ListenUDP failed:", err)
+		return nil, err
+	}
+	return sock, nil
+}
+
+func recvData(sock *net.UDPConn) ([]byte, *net.UDPAddr, error) {
+	data := make([]byte, PACKAGE_MAX)
+	count, peer, err := sock.ReadFromUDP(data)
+	if err != nil {
+		log.Println("ReadFormUDP failed:", err)
+		return nil, nil, err
+	}
+	return data[:count], peer, nil
+}
+
+func proxyQuery(data []byte, serv *net.UDPConn, client *net.UDPAddr) {
+	sock, err := bindUDP("10.15.44.83:0")
+	if err != nil {
+		log.Println("bindUDP failed:", err)
+		return
+	}
+	defer sock.Close()
+	realaddr, err := net.ResolveUDPAddr("udp", "127.0.1.1:53")
+	if err != nil {
+		panic(err)
+	}
+	_, err = sock.WriteToUDP(data, realaddr)
+	if err != nil {
+		log.Println("WriteToUDP:", err)
+		return
+	}
+	data = make([]byte, PACKAGE_MAX)
+	count, _, err := sock.ReadFromUDP(data)
+	if err != nil {
+		log.Println("Read Error:", err)
+		return
+	}
+	serv.WriteToUDP(data[:count], client)
+}
+
+func queryWeb(domain string) (string, error) {
+	resp, err := httpClient.PostForm("http://ping.eu/action.php?atype=3", url.Values{"host": []string{domain}})
+	if err != nil {
+		log.Println("PostForm failed:", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+	r, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Println("ReadAll failed:", err)
+		return "", err
+	}
+	for _, result := range exp.FindAllSubmatch(r, -1) {
+		ip := string(result[1])
+		if ip != "127.0.0.1" {
+			return ip, err
+		}
+	}
+	return "", nil
 }
 
 func main() {
 	log.Println("start")
-	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:53")
+	sock, err := bindUDP("10.15.44.83:53")
 	if err != nil {
-		panic(err)
+		log.Println("bindUDP failed:", err)
+		return
 	}
-	ln, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		panic(err)
-	}
+	defer sock.Close()
 	for {
-		data := make([]byte, PACKAGE_MAX)
-		count, peer, err := ln.ReadFromUDP(data)
-		if err != nil {
-			log.Printf("Read Error: %s\n", err.Error())
-			continue
-		}
-		if count < 12 {
-			log.Println("Package Too Short: %v\n", count)
-			continue
-		}
-		data = data[:count]
+		data, peer, err := recvData(sock)
+		log.Println("recv query")
 		id, domain, err := parseQuery(data)
-
-		b, err := buildAnswer(id, domain, "1.2.3.4")
 		if err != nil {
-			log.Println("buildAnswer Error: %s\n", err.Error())
+			log.Println("parseQuery failed:", err)
 			continue
 		}
-		ln.WriteToUDP(b, peer)
+		if domain == "" {
+			log.Println("proxyQuery")
+			go proxyQuery(data, sock, peer)
+		} else {
+			log.Println("queryWeb:", domain)
+			ip, err := queryWeb(domain)
+			if err != nil {
+				log.Println("queryWeb failed:", err)
+				go proxyQuery(data, sock, peer)
+			} else if ip == "" {
+				log.Println("queryWeb failed: not found")
+				go proxyQuery(data, sock, peer)
+			} else {
+				log.Println("queryWeb get", ip)
+				data, err := buildAnswer(id, domain, ip)
+				if err != nil {
+					log.Println("buildAnswer failed:", err)
+					continue
+				}
+				n, err := sock.WriteToUDP(data, peer)
+				if err != nil {
+					log.Println("WriteToUDP failed:", err)
+					continue
+				}
+				if n != len(data) {
+					log.Println("WriteToUD failed: buffer full")
+					continue
+				}
+			}
+		}
 	}
 }
